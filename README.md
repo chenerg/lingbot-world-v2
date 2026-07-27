@@ -108,7 +108,12 @@ We provide `generate.py` for causal inference with KV caching, which processes v
   torchrun --nproc_per_node=8 generate.py --task i2v-A14B --size 480*832 --ckpt_dir lingbot-world-v2-14b-causal-fast --image examples/03/image.jpg --action_path examples/03 --dit_fsdp --t5_fsdp --ulysses_size 8 --frame_num 361 --local_attn_size 18 --sink_size 6 --prompt "A serene lakeside scene with a lone tree standing in calm water, surrounded by distant snow-capped mountains under a bright blue sky with drifting white clouds — gentle ripples reflect the tree and sky, creating a tranquil, meditative atmosphere."
   ```
 
-- `causal_fast` — multi-segment prompts (static camera, `examples/06`): keeps self-attn KV across segments and switches text at each boundary. `--prompts` uses `|||` as separator; `--segment_frames` lists frames per segment (`4n+1` recommended).
+- `causal_fast` — multi-segment prompts (static camera, `examples/06`): keeps self-attn KV across segments and switches text at each boundary.
+  - `--prompts`: segments separated by `|||`
+  - `--segment_frames`: comma-separated frame counts per segment (`4n+1` recommended; aligned down by VAE/`chunk_size`)
+  - Multi-GPU: set `--nproc_per_node=N`, `--ulysses_size N` (must equal world size), and enable `--dit_fsdp --t5_fsdp`. `N` must divide `num_heads=40` (valid: 2/4/5/8/…).
+
+  8-GPU (matches default setup):
   ``` sh
   torchrun --nproc_per_node=8 generate.py \
     --task i2v-A14B --size 480*832 \
@@ -118,6 +123,24 @@ We provide `generate.py` for causal inference with KV caching, which processes v
     --local_attn_size 18 --sink_size 6 \
     --prompts "A slow view of Stonehenge on a misty, overcast day, ancient standing stones in serene stillness under soft grey light.|||Golden sunlight breaks through the clouds, warm rays lighting the stones, long shadows stretch across the grass." \
     --segment_frames 81,81
+  ```
+
+  4-GPU (e.g. 4×24GB); OOM → add `--offload_model true` or shorten `--segment_frames`:
+  ``` sh
+  torchrun --nproc_per_node=4 generate.py \
+    --task i2v-A14B --size 480*832 \
+    --ckpt_dir lingbot-world-v2-14b-causal-fast \
+    --image examples/06/image.jpg --action_path examples/06 \
+    --dit_fsdp --t5_fsdp --ulysses_size 4 \
+    --local_attn_size 18 --sink_size 6 \
+    --prompts "A slow view of Stonehenge on a misty, overcast day, ancient standing stones in serene stillness under soft grey light.|||Golden sunlight breaks through the clouds, warm rays lighting the stones, long shadows stretch across the grass." \
+    --segment_frames 81,81
+  ```
+
+  Or use the helper script:
+  ``` sh
+  bash run_multi_prompt.sh lingbot-world-v2-14b-causal-fast 8
+  # bash run_multi_prompt.sh <weights_dir> <num_gpus>
   ```
 
 <!-- - `causal_pretrain` — 480P, multi-GPU:
