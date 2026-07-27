@@ -383,6 +383,57 @@ class WanI2VCausal:
         return x0_pred.to(original_dtype)
 
 
+    def _frames_to_lat_f(self, frame_num, chunk_size):
+        """Pixel frames -> latent frames, aligned to chunk_size (4n+1 pixels)."""
+        F = ((int(frame_num) - 1) // 4) * 4 + 1
+        lat_f = (F - 1) // self.vae_stride[0] + 1
+        lat_f = int(lat_f - (lat_f % chunk_size))
+        return max(lat_f, 0)
+
+    def _encode_prompt(self, prompt, offload_model=True):
+        cache_key = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+        if cache_key in self._t5_cache:
+            return self._t5_cache[cache_key]
+        if not self.t5_cpu:
+            self.text_encoder.model.to(self.device)
+            context = self.text_encoder([prompt], self.device)
+            if offload_model:
+                self.text_encoder.model.cpu()
+        else:
+            context = self.text_encoder([prompt], torch.device('cpu'))
+            context = [t.to(self.device) for t in context]
+        self._t5_cache[cache_key] = context
+        return context
+
+    def _normalize_prompt_segments(self, input_prompt, frame_num):
+        """Single shot or multi-segment: prompts[i] covers seg_lat_fs[i] latent frames.
+
+        - prompt str + frame_num int → one segment (original behavior)
+        - prompt list + frame_num list → multi-segment continue (keep self-KV)
+        """
+        if isinstance(input_prompt, (list, tuple)):
+            prompts = [str(p) for p in input_prompt]
+            if isinstance(frame_num, (list, tuple)):
+                seg_frames = list(frame_num)
+            else:
+                raise ValueError(
+                    "multi-prompt generate requires frame_num as a list "
+                    "(frames per segment), e.g. frame_num=[81, 81]")
+            if len(prompts) != len(seg_frames):
+                raise ValueError(
+                    f"len(prompts)={len(prompts)} != len(frame_num)={len(seg_frames)}")
+            if len(prompts) < 1:
+                raise ValueError("prompts must be non-empty")
+        else:
+            prompts = [input_prompt]
+            if isinstance(frame_num, (list, tuple)):
+                if len(frame_num) != 1:
+                    raise ValueError("single prompt requires a single frame_num")
+                seg_frames = list(frame_num)
+            else:
+                seg_frames = [frame_num]
+        return prompts, seg_frames
+
     def generate(self,
                  input_prompt,
                  img,
@@ -403,10 +454,16 @@ class WanI2VCausal:
         `self.infer_mode`:
             - "causal_fast": distilled few-step sampling (`_generate_causal_fast`)
             - "causal_pretrain": 40-step CFG sampling (`_generate_causal_pretrain`)
+
+        Multi-segment (causal_fast only): pass
+            input_prompt=["seg1 text", "seg2 text"], frame_num=[81, 81]
+        Keeps self-attn KV across segments; rebuilds text/cross-attn per segment.
         """
         gen_fn = (self._generate_causal_fast
                   if self.infer_mode == "causal_fast"
                   else self._generate_causal_pretrain)
+        if self.infer_mode != "causal_fast" and isinstance(input_prompt, (list, tuple)):
+            raise ValueError("multi-prompt continuation only supports infer_mode=causal_fast")
         return gen_fn(
             input_prompt,
             img,
@@ -435,56 +492,52 @@ class WanI2VCausal:
                               max_sequence_length=512,
                               max_attention_size=None,):
         r"""
-        Generates video frames from input image and text prompt using diffusion process.
+        Causal-fast i2v. Supports multi-segment prompt continuation:
 
-        Args:
-            input_prompt (`str`):
-                Text prompt for content generation.
-            img (PIL.Image.Image):
-                Input image tensor. Shape: [3, H, W]
-            max_area (`int`, *optional*, defaults to 720*1280):
-                Maximum pixel area for latent space calculation. Controls video resolution scaling
-            frame_num (`int`, *optional*, defaults to 81):
-                How many frames to sample from a video. The number should be 4n+1
-            shift (`float`, *optional*, defaults to 5.0):
-                Noise schedule shift parameter. Affects temporal dynamics
-                [NOTE]: If you want to generate a 480p video, it is recommended to set the shift value to 3.0.
-            sample_solver (`str`, *optional*, defaults to 'unipc'):
-                Solver used to sample the video.
-            sampling_steps (`int`, *optional*, defaults to 40):
-                Number of diffusion sampling steps. Higher values improve quality but slow generation
-            seed (`int`, *optional*, defaults to -1):
-                Random seed for noise generation. If -1, use random seed
-            offload_model (`bool`, *optional*, defaults to True):
-                If True, offloads models to CPU during generation to save VRAM
+            input_prompt=["a lake...", "suddenly it rains..."],
+            frame_num=[81, 81]
 
-        Returns:
-            torch.Tensor:
-                Generated video frames tensor. Dimensions: (C, N H, W) where:
-                - C: Color channels (3 for RGB)
-                - N: Number of frames (81)
-                - H: Frame height (from max_area)
-                - W: Frame width from max_area)
+        Self-attn KV cache is kept across segments; text cross-attn is reset
+        when the prompt changes.
         """
+        batch_size = 1
+        prompts, seg_frames = self._normalize_prompt_segments(input_prompt, frame_num)
 
-        if input_prompt is not None and isinstance(input_prompt, str):
-            batch_size = 1
-        elif input_prompt is not None and isinstance(input_prompt, list):
-            batch_size = len(input_prompt)
-        else:
-            batch_size = 1
-        
         assert action_path is not None, "action_path is required"
-        c2ws = np.load(os.path.join(action_path, "poses.npy")) # opencv coordinate
-        len_c2ws = ((len(c2ws) - 1) // 4) * 4 + 1
-        frame_num = ((frame_num - 1) // 4) * 4 + 1
-        frame_num = min(frame_num, len_c2ws)
-        c2ws = c2ws[:frame_num]
+        c2ws_all = np.load(os.path.join(action_path, "poses.npy"))
+        len_c2ws_max = ((len(c2ws_all) - 1) // 4) * 4 + 1
 
-        # preprocess
+        seg_lat_fs = [self._frames_to_lat_f(f, chunk_size) for f in seg_frames]
+        if any(x <= 0 for x in seg_lat_fs):
+            raise ValueError(f"segment frame_num too small for chunk_size={chunk_size}: {seg_frames}")
+
+        # shrink tail segments if pose is shorter than requested total
+        max_lat_f = self._frames_to_lat_f(len_c2ws_max, chunk_size)
+        total_lat_f = sum(seg_lat_fs)
+        if total_lat_f > max_lat_f:
+            remain = max_lat_f
+            new_seg = []
+            for lf in seg_lat_fs:
+                take = min(lf, remain)
+                take = take - (take % chunk_size)
+                new_seg.append(take)
+                remain -= take
+            seg_lat_fs = new_seg
+            while seg_lat_fs and seg_lat_fs[-1] == 0:
+                seg_lat_fs.pop()
+                prompts = prompts[:len(seg_lat_fs)]
+            if not seg_lat_fs:
+                raise ValueError("action_path poses too short for any chunk")
+            total_lat_f = sum(seg_lat_fs)
+            logging.info(
+                f"pose length caps generation: seg_lat_fs={seg_lat_fs} (prompts={len(prompts)})")
+
+        lat_f = total_lat_f
+        F = (lat_f - 1) * 4 + 1
+        c2ws = c2ws_all[:F]
+
+        # preprocess image / geometry
         img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
-
-        F = frame_num
         h, w = img.shape[1:]
         aspect_ratio = h / w
         lat_h = round(
@@ -495,69 +548,33 @@ class WanI2VCausal:
             self.patch_size[2] * self.patch_size[2])
         h = lat_h * self.vae_stride[1]
         w = lat_w * self.vae_stride[2]
-        lat_f = (F - 1) // self.vae_stride[0] + 1
-        lat_f = int(lat_f - (lat_f % chunk_size))
-        F = (lat_f - 1) * 4 + 1
         max_seq_len = chunk_size * lat_h * lat_w // (
             self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
-        # Reset per-generate state: cross-attn K/V cache will be freshly
-        # initialized below; the first DiT forward must compute and store.
-        self._cross_attn_initialized = False
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
         noise = torch.randn(
-            16,
-            lat_f,
-            lat_h,
-            lat_w,
-            dtype=torch.float32,
-            generator=seed_g,
-            device=self.device)
+            16, lat_f, lat_h, lat_w,
+            dtype=torch.float32, generator=seed_g, device=self.device)
 
         msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
         msk = torch.concat([
             torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-        ],
-                           dim=1)
+        ], dim=1)
         msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
         msk = msk.transpose(1, 2)[0]
 
-        # 2. Prepare timesteps
         self.scheduler.set_timesteps(self.num_train_timesteps, shift=shift)
         timesteps = self.scheduler.timesteps[timesteps_index]
 
-        # preprocess
-        # T5 cache: skip the encoder entirely if we've seen this exact prompt
-        # before in this pipe instance. Bit-identical: cached tensor is the
-        # same object returned by the prior call.
-        cache_key = hashlib.sha256(input_prompt.encode('utf-8')).hexdigest()
-        if cache_key in self._t5_cache:
-            context = self._t5_cache[cache_key]
-        else:
-            if not self.t5_cpu:
-                self.text_encoder.model.to(self.device)
-                context = self.text_encoder([input_prompt], self.device)
-                if offload_model:
-                    self.text_encoder.model.cpu()
-            else:
-                context = self.text_encoder([input_prompt], torch.device('cpu'))
-                context = [t.to(self.device) for t in context]
-            self._t5_cache[cache_key] = context
-
         Ks = torch.from_numpy(np.load(os.path.join(action_path, "intrinsics.npy"))).float()
-
-        # The provided intrinsics are for original image size (480p). We need to transform them according to the new image size (h, w).
         Ks = get_Ks_transformed(Ks,
-                                height_org=480,
-                                width_org=832,
-                                height_resize=h,
-                                width_resize=w,
-                                height_final=h,
-                                width_final=w)
+                                height_org=480, width_org=832,
+                                height_resize=h, width_resize=w,
+                                height_final=h, width_final=w)
         Ks = Ks[0]
 
         len_c2ws = len(c2ws)
@@ -571,39 +588,25 @@ class WanI2VCausal:
         )
         c2ws_infer = compute_relative_poses(c2ws_infer, framewise=True)
         Ks = Ks.repeat(len(c2ws_infer), 1)
-
         c2ws_infer = c2ws_infer.to(self.device)
         Ks = Ks.to(self.device)
-        wasd_action = None
         c2ws_plucker_emb = get_plucker_embeddings(c2ws_infer, Ks, h, w)
         c2ws_plucker_emb = rearrange(
             c2ws_plucker_emb,
             'f (h c1) (w c2) c -> (f h w) (c c1 c2)',
-            c1=int(h // lat_h),
-            c2=int(w // lat_w),
+            c1=int(h // lat_h), c2=int(w // lat_w),
         )
-        c2ws_plucker_emb = c2ws_plucker_emb[None, ...] # [b, f*h*w, c]
-        c2ws_plucker_emb = rearrange(c2ws_plucker_emb, 'b (f h w) c -> b c f h w', f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
-        if wasd_action is not None:
-            wasd_action_tensor = wasd_action[:, None, None, :].repeat(1, h, w, 1) # [f, h, w, 3]
-            wasd_action_tensor = rearrange(
-                wasd_action_tensor,
-                'f (h c1) (w c2) c -> (f h w) (c c1 c2)',
-                c1=int(h // lat_h),
-                c2=int(w // lat_w),
-            )
-            wasd_action_tensor = wasd_action_tensor[None, ...] # [b, f*h*w, c]
-            wasd_action_tensor = rearrange(wasd_action_tensor, 'b (f h w) c -> b c f h w', f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
-            c2ws_plucker_emb = torch.cat([c2ws_plucker_emb, wasd_action_tensor], dim=1)
+        c2ws_plucker_emb = c2ws_plucker_emb[None, ...]
+        c2ws_plucker_emb = rearrange(
+            c2ws_plucker_emb, 'b (f h w) c -> b c f h w',
+            f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
 
         y = self.vae.encode([
             torch.concat([
                 torch.nn.functional.interpolate(
-                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
+                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(0, 1),
                 torch.zeros(3, F - 1, h, w)
-            ],
-                         dim=1).to(self.device)
+            ], dim=1).to(self.device)
         ])[0]
         y = torch.concat([msk, y])
 
@@ -613,10 +616,9 @@ class WanI2VCausal:
 
         no_sync_model = getattr(self.model, 'no_sync', noop_no_sync)
 
-        # Initialize KV cache to all zeros
         model_args = self.model.config
         transformer_dtype = self.pipe_dtype
-        frame_seqlen = int(noise.shape[-2] * noise.shape[-1]// 4)
+        frame_seqlen = int(noise.shape[-2] * noise.shape[-1] // 4)
         if self.local_attn_size > -1:
             kv_size = frame_seqlen * self.local_attn_size
         else:
@@ -624,37 +626,63 @@ class WanI2VCausal:
         head_dim = model_args.dim // model_args.num_heads
         local_num_heads = model_args.num_heads // self.sp_size
         self_kv_shape = [batch_size, kv_size, local_num_heads, head_dim]
-        self_kv_cache = self._initialize_self_kv_cache(num_layers=model_args.num_layers,
-                                                       shape=self_kv_shape,
-                                                       dtype=transformer_dtype,
-                                                       device=self.device)
         cross_kv_shape = [batch_size, max_sequence_length, model_args.num_heads, head_dim]
-        cross_kv_cache = self._initialize_crossattn_cache(num_layers=model_args.num_layers,
-                                                          shape=cross_kv_shape,
-                                                          dtype=transformer_dtype,
-                                                          device=self.device)
-        # evaluation mode
+
+        # self-KV lives for the whole video; cross-KV rebuilt per prompt segment
+        self_kv_cache = self._initialize_self_kv_cache(
+            num_layers=model_args.num_layers,
+            shape=self_kv_shape,
+            dtype=transformer_dtype,
+            device=self.device)
+
+        # chunk -> segment id
+        chunks_per_seg = [lf // chunk_size for lf in seg_lat_fs]
+        seg_of_chunk = []
+        for si, nch in enumerate(chunks_per_seg):
+            seg_of_chunk.extend([si] * nch)
+
+        attn_size = kv_size if max_attention_size is None else max_attention_size
+        videos = None
+
         with (
                 torch.amp.autocast('cuda', dtype=self.param_dtype),
                 torch.no_grad(),
                 no_sync_model(),
         ):
-            # sample videos
-            latent = noise
-            latents_chunk = latent.split(chunk_size, dim=1) # [c, f, h, w]
+            latents_chunk = noise.split(chunk_size, dim=1)
             condition_chunk = y.split(chunk_size, dim=1)
             c2ws_plucker_emb_chunk = c2ws_plucker_emb.split(chunk_size, dim=2)
             num_inference_chunk = len(latents_chunk)
+            assert num_inference_chunk == len(seg_of_chunk), (
+                f"chunk mismatch {num_inference_chunk} vs {len(seg_of_chunk)}")
+
             pred_latent_chunks = []
+            cur_seg = -1
+            context = None
+            cross_kv_cache = None
+
             for chunk_id in tqdm(range(num_inference_chunk)):
+                seg_id = seg_of_chunk[chunk_id]
+                if seg_id != cur_seg:
+                    # ponytail: hard switch text stream; self-KV keeps temporal memory
+                    context = self._encode_prompt(prompts[seg_id], offload_model)
+                    cross_kv_cache = self._initialize_crossattn_cache(
+                        num_layers=model_args.num_layers,
+                        shape=cross_kv_shape,
+                        dtype=transformer_dtype,
+                        device=self.device)
+                    self._cross_attn_initialized = False
+                    cur_seg = seg_id
+                    logging.info(
+                        f"segment {seg_id + 1}/{len(prompts)} "
+                        f"prompt={prompts[seg_id][:80]!r}...")
+
                 current_latent = latents_chunk[chunk_id]
                 current_condition = condition_chunk[chunk_id]
                 current_c2ws_plucker_emb = c2ws_plucker_emb_chunk[chunk_id]
-
                 dit_cond_dict = {
                     "c2ws_plucker_emb": current_c2ws_plucker_emb.chunk(1, dim=0),
                 }
-
                 kwargs = {
                     'context': [context[0]],
                     'seq_len': max_seq_len,
@@ -663,7 +691,7 @@ class WanI2VCausal:
                     'kv_cache': self_kv_cache,
                     'crossattn_cache': cross_kv_cache,
                     'current_start': chunk_id * chunk_size * frame_seqlen,
-                    'max_attention_size': kv_size if max_attention_size is None else max_attention_size,
+                    'max_attention_size': attn_size,
                     'frame_seqlen': frame_seqlen,
                 }
 
@@ -673,7 +701,6 @@ class WanI2VCausal:
                 for timestep_idx in range(len(timesteps)):
                     latent_model_input = [current_latent.to(self.device)]
                     current_timestep = [timesteps[timestep_idx]]
-
                     timestep = torch.stack(current_timestep).to(self.device)
 
                     noise_pred = self.model(
@@ -694,14 +721,17 @@ class WanI2VCausal:
 
                     if timestep_idx < len(timesteps) - 1:
                         next_timestep = timesteps[timestep_idx + 1]
-                        current_latent = self.scheduler.add_noise(x0, torch.randn(x0.shape, generator=seed_g, device=x0.device, dtype=x0.dtype), next_timestep)
+                        current_latent = self.scheduler.add_noise(
+                            x0,
+                            torch.randn(x0.shape, generator=seed_g,
+                                        device=x0.device, dtype=x0.dtype),
+                            next_timestep)
                     else:
-                        # note return x0
                         break
 
                 pred_latent_chunks.append(x0)
 
-                # Update kv cache
+                # write clean latent into self-KV for later chunks / segments
                 context_timestep = [timesteps[-1] * 0.0]
                 timestep = torch.stack(context_timestep).to(self.device)
                 self.model(x=[x0], t=timestep,
@@ -717,8 +747,6 @@ class WanI2VCausal:
             if self.rank == 0:
                 videos = self.vae.decode([pred_latent_chunks])
 
-        # del noise, latent, x0
-        # del sample_scheduler
         if offload_model:
             gc.collect()
             torch.cuda.synchronize()

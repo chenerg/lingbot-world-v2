@@ -35,8 +35,26 @@ def _validate_args(args):
     assert args.task in WAN_CONFIGS, f"Unsupport task: {args.task}"
     assert args.task in EXAMPLE_PROMPT, f"Unsupport task: {args.task}"
 
-    if args.prompt is None:
+    args.prompt_list = None
+    args.segment_frame_list = None
+    if args.prompts is not None:
+        args.prompt_list = [p.strip() for p in args.prompts.split("|||") if p.strip()]
+        assert args.prompt_list, "empty --prompts"
+        assert args.segment_frames is not None, \
+            "--prompts requires --segment_frames (e.g. 81,81)"
+        args.segment_frame_list = [
+            int(x.strip()) for x in args.segment_frames.split(",") if x.strip()
+        ]
+        assert len(args.prompt_list) == len(args.segment_frame_list), (
+            f"prompts ({len(args.prompt_list)}) != segment_frames "
+            f"({len(args.segment_frame_list)})")
+        assert args.infer_mode == "causal_fast", \
+            "multi-prompt continuation only supports --infer_mode causal_fast"
+        args.prompt = args.prompt_list[0]
+        args.frame_num = sum(args.segment_frame_list)
+    elif args.prompt is None:
         args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
+
     if args.image is None and "image" in EXAMPLE_PROMPT[args.task]:
         args.image = EXAMPLE_PROMPT[args.task]["image"]
 
@@ -136,6 +154,19 @@ def _parse_args():
         default=None,
         help="The prompt to generate the video from.")
     parser.add_argument(
+        "--prompts",
+        type=str,
+        default=None,
+        help="Multi-segment prompts separated by '|||'. Keeps self-attn KV "
+             "across segments and switches text at each boundary. "
+             "Requires --segment_frames. causal_fast only.")
+    parser.add_argument(
+        "--segment_frames",
+        type=str,
+        default=None,
+        help="Comma-separated frame counts per segment, e.g. '81,81'. "
+             "Used with --prompts.")
+    parser.add_argument(
         "--base_seed",
         type=int,
         default=42,
@@ -217,13 +248,21 @@ def run_causal(args, cfg, img, device, rank, mode="causal_fast"):
         infer_mode=mode,
     )
     logging.info("Generating video ...")
+    if args.prompt_list is not None:
+        prompt_arg = args.prompt_list
+        frame_arg = args.segment_frame_list
+        logging.info(
+            f"multi-segment: {len(prompt_arg)} prompts, frames={frame_arg}")
+    else:
+        prompt_arg = args.prompt
+        frame_arg = args.frame_num
     return wan_i2v.generate(
-        args.prompt,
+        prompt_arg,
         img,
         action_path=args.action_path,
         chunk_size=args.chunk_size,
         max_area=MAX_AREA_CONFIGS[args.size],
-        frame_num=args.frame_num,
+        frame_num=frame_arg,
         shift=args.sample_shift,
         seed=args.base_seed,
         offload_model=args.offload_model,
@@ -271,7 +310,12 @@ def generate(args):
         dist.broadcast_object_list(base_seed, src=0)
         args.base_seed = base_seed[0]
 
-    logging.info(f"Input prompt: {args.prompt}")
+    if args.prompt_list is not None:
+        logging.info(f"Input prompts ({len(args.prompt_list)} segments):")
+        for i, (p, f) in enumerate(zip(args.prompt_list, args.segment_frame_list)):
+            logging.info(f"  [{i}] frames={f}: {p[:120]}")
+    else:
+        logging.info(f"Input prompt: {args.prompt}")
     img = None
     if args.image is not None:
         img = Image.open(args.image).convert("RGB")
@@ -283,7 +327,8 @@ def generate(args):
         os.makedirs(args.save_dir, exist_ok=True)
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            formatted_prompt = args.prompt.replace(" ", "_").replace("/", "_")[:50]
+            label = args.prompt if args.prompt_list is None else f"{len(args.prompt_list)}seg"
+            formatted_prompt = label.replace(" ", "_").replace("/", "_")[:50]
             suffix = '.mp4'
             args.save_file = f"lingbot-world-v2-{args.infer_mode}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}" + suffix
             args.save_file = f'{args.save_dir}/{args.save_file}'
