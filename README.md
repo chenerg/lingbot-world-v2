@@ -121,7 +121,7 @@ We provide `generate.py` for causal inference with KV caching, which processes v
     --image examples/06/image.jpg --action_path examples/06 \
     --dit_fsdp --t5_fsdp --ulysses_size 8 \
     --local_attn_size 18 --sink_size 6 \
-    --prompts "A slow view of Stonehenge on a misty, overcast day, ancient standing stones in serene stillness under soft grey light.|||Golden sunlight breaks through the clouds, warm rays lighting the stones, long shadows stretch across the grass." \
+    --prompts "Cover the red and blue balls with the two white cups.|||Lift the cup covering the blue ball to reveal it. Keep the red ball covered." \
     --segment_frames 81,81
   ```
 
@@ -133,7 +133,7 @@ We provide `generate.py` for causal inference with KV caching, which processes v
     --image examples/06/image.jpg --action_path examples/06 \
     --dit_fsdp --t5_fsdp --ulysses_size 4 \
     --local_attn_size 18 --sink_size 6 \
-    --prompts "A slow view of Stonehenge on a misty, overcast day, ancient standing stones in serene stillness under soft grey light.|||Golden sunlight breaks through the clouds, warm rays lighting the stones, long shadows stretch across the grass." \
+    --prompts "Cover the red and blue balls with the two white cups.|||Lift the cup covering the blue ball to reveal it. Keep the red ball covered." \
     --segment_frames 81,81
   ```
 
