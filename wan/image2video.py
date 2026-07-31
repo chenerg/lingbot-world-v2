@@ -7,7 +7,6 @@ import random
 import sys
 import time
 import types
-from contextlib import contextmanager
 from functools import partial
 
 import numpy as np
@@ -276,19 +275,13 @@ class WanI2VCausal:
         dummy_t = torch.tensor(
             [500.0], device=self.device, dtype=torch.float32)
 
-        @contextmanager
-        def _noop_no_sync():
-            yield
-        no_sync_model = getattr(self.model, 'no_sync', _noop_no_sync)
-
         if dist.is_initialized():
             torch.cuda.synchronize()
             dist.barrier()
         t0 = time.perf_counter()
 
         with torch.amp.autocast('cuda', dtype=self.param_dtype), \
-             torch.no_grad(), \
-             no_sync_model():
+             torch.no_grad():
             _ = self.model(
                 x=[dummy_latent],
                 t=dummy_t,
@@ -610,12 +603,6 @@ class WanI2VCausal:
         ])[0]
         y = torch.concat([msk, y])
 
-        @contextmanager
-        def noop_no_sync():
-            yield
-
-        no_sync_model = getattr(self.model, 'no_sync', noop_no_sync)
-
         model_args = self.model.config
         transformer_dtype = self.pipe_dtype
         frame_seqlen = int(noise.shape[-2] * noise.shape[-1] // 4)
@@ -647,7 +634,6 @@ class WanI2VCausal:
         with (
                 torch.amp.autocast('cuda', dtype=self.param_dtype),
                 torch.no_grad(),
-                no_sync_model(),
         ):
             latents_chunk = noise.split(chunk_size, dim=1)
             condition_chunk = y.split(chunk_size, dim=1)
@@ -886,12 +872,6 @@ class WanI2VCausal:
         ])[0]
         y = torch.concat([msk, y])
 
-        @contextmanager
-        def noop_no_sync():
-            yield
-
-        no_sync_model = getattr(self.model, 'no_sync', noop_no_sync)
-
         model_args = self.model.config
         transformer_dtype = self.pipe_dtype
         frame_seqlen = int(noise.shape[-2] * noise.shape[-1] // 4)
@@ -926,7 +906,6 @@ class WanI2VCausal:
         with (
                 torch.amp.autocast('cuda', dtype=self.param_dtype),
                 torch.no_grad(),
-                no_sync_model(),
         ):
             latent = noise
             latents_chunk = latent.split(chunk_size, dim=1)          # [c, f, h, w]

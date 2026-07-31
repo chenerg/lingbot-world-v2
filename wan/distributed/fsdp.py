@@ -15,7 +15,7 @@ def shard_model(
     reduce_dtype=torch.float32,
     buffer_dtype=torch.float32,
     process_group=None,
-    sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+    sharding_strategy=ShardingStrategy.FULL_SHARD,
     sync_module_states=True,
     use_lora=False
 ):
